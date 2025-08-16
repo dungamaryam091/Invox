@@ -12,9 +12,20 @@
 (define-constant err-subscription-not-active (err u107))
 (define-constant err-payment-not-due (err u108))
 (define-constant err-invalid-interval (err u109))
+(define-constant err-escrow-not-found (err u110))
+(define-constant err-escrow-already-funded (err u111))
+(define-constant err-escrow-not-funded (err u112))
+(define-constant err-escrow-already-completed (err u113))
+(define-constant err-not-authorized (err u114))
+(define-constant err-dispute-already-exists (err u115))
+(define-constant err-dispute-not-found (err u116))
+(define-constant err-invalid-arbitrator (err u117))
+(define-constant err-escrow-under-dispute (err u118))
 
 (define-data-var last-token-id uint u0)
 (define-data-var last-subscription-id uint u0)
+(define-data-var last-escrow-id uint u0)
+(define-data-var last-dispute-id uint u0)
 
 (define-map invoices
     uint 
@@ -62,6 +73,45 @@
         payment-date: uint,
         payment-tx: (string-ascii 64),
         auto-generated: bool
+    }
+)
+
+(define-map escrows
+    uint
+    {
+        invoice-id: uint,
+        payer: principal,
+        payee: principal,
+        amount: uint,
+        status: (string-ascii 20),
+        created-at: uint,
+        funded-at: (optional uint),
+        completed-at: (optional uint),
+        arbitrator: (optional principal),
+        description: (string-ascii 256)
+    }
+)
+
+(define-map disputes
+    uint
+    {
+        escrow-id: uint,
+        initiator: principal,
+        reason: (string-ascii 512),
+        status: (string-ascii 20),
+        created-at: uint,
+        resolved-at: (optional uint),
+        resolution: (optional (string-ascii 512)),
+        winner: (optional principal)
+    }
+)
+
+(define-map arbitrators
+    principal
+    {
+        active: bool,
+        total-cases: uint,
+        reputation-score: uint
     }
 )
 
@@ -318,3 +368,191 @@
         entries
     )
 )
+
+(define-public (create-escrow (invoice-id uint) (payee principal) (arbitrator (optional principal)) (description (string-ascii 256)))
+    (let
+        (
+            (invoice (unwrap! (map-get? invoices invoice-id) err-not-found))
+            (new-escrow-id (+ (var-get last-escrow-id) u1))
+        )
+        (asserts! (is-eq (get payer invoice) tx-sender) err-not-authorized)
+        (asserts! (is-eq (get status invoice) "PENDING") err-invalid-status)
+        (var-set last-escrow-id new-escrow-id)
+        (map-set escrows new-escrow-id {
+            invoice-id: invoice-id,
+            payer: tx-sender,
+            payee: payee,
+            amount: (get amount invoice),
+            status: "CREATED",
+            created-at: stacks-block-height,
+            funded-at: none,
+            completed-at: none,
+            arbitrator: arbitrator,
+            description: description
+        })
+        (ok new-escrow-id)
+    )
+)
+
+(define-public (fund-escrow (escrow-id uint))
+    (let
+        (
+            (escrow (unwrap! (map-get? escrows escrow-id) err-escrow-not-found))
+        )
+        (asserts! (is-eq (get payer escrow) tx-sender) err-not-authorized)
+        (asserts! (is-eq (get status escrow) "CREATED") err-escrow-already-funded)
+        (try! (stx-transfer? (get amount escrow) tx-sender (as-contract tx-sender)))
+        (map-set escrows escrow-id (merge escrow {
+            status: "FUNDED",
+            funded-at: (some stacks-block-height)
+        }))
+        (ok true)
+    )
+)
+
+(define-public (complete-escrow (escrow-id uint))
+    (let
+        (
+            (escrow (unwrap! (map-get? escrows escrow-id) err-escrow-not-found))
+        )
+        (asserts! (is-eq (get payee escrow) tx-sender) err-not-authorized)
+        (asserts! (is-eq (get status escrow) "FUNDED") err-escrow-not-funded)
+        (try! (as-contract (stx-transfer? (get amount escrow) tx-sender (get payee escrow))))
+        (map-set escrows escrow-id (merge escrow {
+            status: "COMPLETED",
+            completed-at: (some stacks-block-height)
+        }))
+        (ok true)
+    )
+)
+
+(define-public (refund-escrow (escrow-id uint))
+    (let
+        (
+            (escrow (unwrap! (map-get? escrows escrow-id) err-escrow-not-found))
+        )
+        (asserts! (is-eq (get payer escrow) tx-sender) err-not-authorized)
+        (asserts! (is-eq (get status escrow) "FUNDED") err-escrow-not-funded)
+        (try! (as-contract (stx-transfer? (get amount escrow) tx-sender (get payer escrow))))
+        (map-set escrows escrow-id (merge escrow {
+            status: "REFUNDED",
+            completed-at: (some stacks-block-height)
+        }))
+        (ok true)
+    )
+)
+
+(define-public (register-arbitrator)
+    (begin
+        (map-set arbitrators tx-sender {
+            active: true,
+            total-cases: u0,
+            reputation-score: u100
+        })
+        (ok true)
+    )
+)
+
+(define-public (deactivate-arbitrator)
+    (let
+        (
+            (arbitrator (unwrap! (map-get? arbitrators tx-sender) err-invalid-arbitrator))
+        )
+        (map-set arbitrators tx-sender (merge arbitrator { active: false }))
+        (ok true)
+    )
+)
+
+(define-public (initiate-dispute (escrow-id uint) (reason (string-ascii 512)))
+    (let
+        (
+            (escrow (unwrap! (map-get? escrows escrow-id) err-escrow-not-found))
+            (new-dispute-id (+ (var-get last-dispute-id) u1))
+        )
+        (asserts! (or (is-eq (get payer escrow) tx-sender) (is-eq (get payee escrow) tx-sender)) err-not-authorized)
+        (asserts! (is-eq (get status escrow) "FUNDED") err-escrow-not-funded)
+        (var-set last-dispute-id new-dispute-id)
+        (map-set disputes new-dispute-id {
+            escrow-id: escrow-id,
+            initiator: tx-sender,
+            reason: reason,
+            status: "OPEN",
+            created-at: stacks-block-height,
+            resolved-at: none,
+            resolution: none,
+            winner: none
+        })
+        (map-set escrows escrow-id (merge escrow { status: "DISPUTED" }))
+        (ok new-dispute-id)
+    )
+)
+
+(define-public (resolve-dispute (dispute-id uint) (winner principal) (resolution (string-ascii 512)))
+    (let
+        (
+            (dispute (unwrap! (map-get? disputes dispute-id) err-dispute-not-found))
+            (escrow (unwrap! (map-get? escrows (get escrow-id dispute)) err-escrow-not-found))
+            (arbitrator-data (unwrap! (map-get? arbitrators tx-sender) err-invalid-arbitrator))
+        )
+        (asserts! (match (get arbitrator escrow) arb (is-eq arb tx-sender) false) err-not-authorized)
+        (asserts! (get active arbitrator-data) err-invalid-arbitrator)
+        (asserts! (is-eq (get status dispute) "OPEN") err-dispute-not-found)
+        (asserts! (or (is-eq winner (get payer escrow)) (is-eq winner (get payee escrow))) err-not-authorized)
+        (try! (as-contract (stx-transfer? (get amount escrow) tx-sender winner)))
+        (map-set disputes dispute-id (merge dispute {
+            status: "RESOLVED",
+            resolved-at: (some stacks-block-height),
+            resolution: (some resolution),
+            winner: (some winner)
+        }))
+        (map-set escrows (get escrow-id dispute) (merge escrow {
+            status: "RESOLVED",
+            completed-at: (some stacks-block-height)
+        }))
+        (map-set arbitrators tx-sender (merge arbitrator-data {
+            total-cases: (+ (get total-cases arbitrator-data) u1)
+        }))
+        (ok true)
+    )
+)
+
+(define-read-only (get-escrow (escrow-id uint))
+    (ok (unwrap! (map-get? escrows escrow-id) err-escrow-not-found))
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+    (ok (unwrap! (map-get? disputes dispute-id) err-dispute-not-found))
+)
+
+(define-read-only (get-arbitrator (arbitrator-principal principal))
+    (ok (unwrap! (map-get? arbitrators arbitrator-principal) err-invalid-arbitrator))
+)
+
+(define-read-only (get-escrow-balance (escrow-id uint))
+    (let
+        (
+            (escrow (unwrap! (map-get? escrows escrow-id) err-escrow-not-found))
+        )
+        (if (is-eq (get status escrow) "FUNDED")
+            (ok (get amount escrow))
+            (ok u0)
+        )
+    )
+)
+
+(define-read-only (is-escrow-funded (escrow-id uint))
+    (match (map-get? escrows escrow-id)
+        escrow (ok (is-eq (get status escrow) "FUNDED"))
+        err-escrow-not-found
+    )
+)
+
+(define-read-only (get-total-escrows)
+    (var-get last-escrow-id)
+)
+
+(define-read-only (get-total-disputes)
+    (var-get last-dispute-id)
+)
+
+
