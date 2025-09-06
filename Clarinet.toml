@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Invox.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.invoice-templates]
+path = 'contracts/invoice-templates.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
